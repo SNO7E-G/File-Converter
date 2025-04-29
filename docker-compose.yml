@@ -1,0 +1,314 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database (default)
+  postgres:
+    image: postgres:15-alpine
+    container_name: file-converter-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-file_converter}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  # MySQL Database (optional)
+  mysql:
+    image: mysql:8
+    container_name: file-converter-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DB:-file_converter}
+      MYSQL_USER: ${MYSQL_USER:-file_converter}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles: ["mysql", "all"]
+    networks:
+      - app-network
+
+  # MongoDB (optional)
+  mongodb:
+    image: mongo:5
+    container_name: file-converter-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-password}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-file_converter}
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    profiles: ["mongodb", "all"]
+    networks:
+      - app-network
+
+  # Redis for caching and background tasks
+  redis:
+    image: redis:alpine
+    container_name: file-converter-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app-network
+
+  # MinIO for S3-compatible storage (optional)
+  minio:
+    image: minio/minio
+    container_name: file-converter-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    profiles: ["s3", "all"]
+    networks:
+      - app-network
+
+  # Create buckets in MinIO
+  createbuckets:
+    image: minio/mc
+    container_name: file-converter-minio-client
+    depends_on:
+      - minio
+    restart: on-failure
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add myminio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      /usr/bin/mc mb myminio/${S3_BUCKET_NAME:-file-converter};
+      /usr/bin/mc anonymous set download myminio/${S3_BUCKET_NAME:-file-converter};
+      exit 0;
+      "
+    profiles: ["s3", "all"]
+    networks:
+      - app-network
+
+  # Celery worker for background tasks
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: file-converter-worker
+    restart: unless-stopped
+    command: celery -A app.tasks.celery worker --loglevel=info
+    volumes:
+      - ./backend:/app
+      - file_uploads:/app/uploads
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      # Database configuration (PostgreSQL by default)
+      DB_TYPE: ${DB_TYPE:-postgresql}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/file_converter}
+      
+      # MySQL configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-file_converter}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
+      MYSQL_DB: ${MYSQL_DB:-file_converter}
+      
+      # PostgreSQL configuration
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-file_converter}
+      
+      # MongoDB configuration
+      MONGODB_URI: ${MONGODB_URI:-mongodb://admin:password@mongodb:27017/file_converter}
+      
+      # Redis & Celery configuration
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      
+      # Storage configuration
+      STORAGE_TYPE: ${STORAGE_TYPE:-local}
+      UPLOAD_DIR: /app/uploads
+      
+      # S3 configuration
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-file-converter}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_ENDPOINT_URL: http://minio:9000
+      
+      # Application settings
+      FLASK_DEBUG: "false"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-your_jwt_secret_key_change_in_production}
+      JWT_REFRESH_SECRET_KEY: ${JWT_REFRESH_SECRET_KEY:-your_refresh_token_secret_key_change_in_production}
+    networks:
+      - app-network
+
+  # Backend API
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: file-converter-api
+    restart: unless-stopped
+    command: gunicorn --bind 0.0.0.0:8000 --workers 4 wsgi:app
+    volumes:
+      - ./backend:/app
+      - file_uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      # Database configuration (PostgreSQL by default)
+      DB_TYPE: ${DB_TYPE:-postgresql}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/file_converter}
+      
+      # MySQL configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-file_converter}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
+      MYSQL_DB: ${MYSQL_DB:-file_converter}
+      
+      # PostgreSQL configuration
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-file_converter}
+      
+      # MongoDB configuration
+      MONGODB_URI: ${MONGODB_URI:-mongodb://admin:password@mongodb:27017/file_converter}
+      
+      # Redis & Celery configuration
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      
+      # Storage configuration
+      STORAGE_TYPE: ${STORAGE_TYPE:-local}
+      UPLOAD_DIR: /app/uploads
+      
+      # S3 configuration
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-file-converter}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_ENDPOINT_URL: http://minio:9000
+      
+      # Application settings
+      FLASK_DEBUG: "false"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-your_jwt_secret_key_change_in_production}
+      JWT_REFRESH_SECRET_KEY: ${JWT_REFRESH_SECRET_KEY:-your_refresh_token_secret_key_change_in_production}
+    networks:
+      - app-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: ${FRONTEND_API_URL:-http://localhost:8000}
+    container_name: file-converter-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    networks:
+      - app-network
+
+  # Optional: pgAdmin for PostgreSQL management
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: file-converter-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@fileconverter.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    profiles: ["tools", "all"]
+    networks:
+      - app-network
+
+  # Optional: phpMyAdmin for MySQL management
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: file-converter-phpmyadmin
+    restart: unless-stopped
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    ports:
+      - "5051:80"
+    depends_on:
+      - mysql
+    profiles: ["mysql", "tools", "all"]
+    networks:
+      - app-network
+
+  # Optional: MongoDB Express for MongoDB management
+  mongo-express:
+    image: mongo-express
+    container_name: file-converter-mongo-express
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USER:-admin}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD:-password}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-password}@mongodb:27017/
+    ports:
+      - "5052:8081"
+    depends_on:
+      - mongodb
+    profiles: ["mongodb", "tools", "all"]
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mysql_data:
+  mongodb_data:
+  redis_data:
+  file_uploads:
+  pgadmin_data:
+  minio_data: 

@@ -1,0 +1,19 @@
+# Node.js dependencies
+node_modules/
+
+# Python virtual environment
+venv/
+*.pyc
+__pycache__/
+
+# Build artifacts
+dist/
+build/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
